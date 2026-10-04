@@ -1,0 +1,6 @@
+[[headers]]
+  for = "/channels.json"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, OPTIONS"
+    Cache-Control = "public, max-age=30, must-revalidate"

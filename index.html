@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>AceBall 直播平台</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/@clappr/player@latest/dist/clappr.min.js"></script>
+</head>
+<body>
+<div class="wrapper">
+    <div class="top-bar">
+        <button class="btn" type="button" onclick="openSchedulePanel()">⚽ 時間表</button>
+        <button class="btn btn-outline" type="button" onclick="exportToM3U()">匯出 M3U</button>
+        <button class="btn btn-outline" type="button" id="openEngineBtn">開 Engine</button>
+        <div class="search-container">
+            <form id="searchForm" style="display:flex;width:100%;gap:6px;margin:0;">
+                <input type="text" id="query" placeholder="搜尋球賽、頻道…" required>
+                <button type="submit" class="search-btn">搜尋</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <div class="left-panel">
+            <div class="player-container">
+                <div id="playerOverlay" class="player-overlay">
+                    <span id="statusText">請從右側選擇頻道</span>
+                    <p id="subStatusText" style="font-size:12px;opacity:.7;">請先喺本機／手機開啟 Ace Stream Engine</p>
+                    <div id="engineBadge" style="font-size:11px;opacity:.75;margin-top:6px;">正在偵測本機 Engine…</div>
+                    <div id="actionBtns" class="action-btns" style="display:none;gap:8px;margin-top:12px;flex-wrap:wrap;justify-content:center;">
+                        <button id="retryBtn" class="btn" type="button" style="height:36px;font-size:13px;">重試</button>
+                        <button id="openAppBtn" class="btn" type="button" style="height:36px;font-size:13px;">使用 Ace Stream App 播放</button>
+                    </div>
+                </div>
+                <div id="player-wrapper"></div>
+            </div>
+        </div>
+
+        <div class="right-panel">
+            <div class="channel-list-header">
+                <span>頻道清單</span>
+                <button class="btn btn-outline" type="button" id="reloadChannelsBtn" style="height:28px;font-size:12px;">重新載入</button>
+            </div>
+            <div id="channelList" class="channel-list">
+                <div class="loading-text">載入頻道清單中...</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="acePanel" class="panel">
+    <div class="panel-header">
+        <span>Ace Stream 搜尋結果</span>
+        <span class="close-btn" onclick="closePanel('acePanel')">&times;</span>
+    </div>
+    <iframe id="aceIframe" title="search"></iframe>
+</div>
+
+<div id="schedulePanel" class="panel">
+    <div class="panel-header">
+        <span>足球直播時間表</span>
+        <span class="close-btn" onclick="closePanel('schedulePanel')">&times;</span>
+    </div>
+    <iframe id="scheduleIframe" title="schedule" src="https://www.live-footballontv.com/popular-competitions.html"></iframe>
+</div>
+
+<script>
+    const CHANNELS_URL = 'https://cootest.netlify.app/channels.json';
+    const ENGINE_HOST = 'http://127.0.0.1';
+    const ENGINE_PORT = 6878;
+    const ENGINE = ENGINE_HOST + ':' + ENGINE_PORT;
+    const TRANSCODE = '&transcode_audio=1&preferred_audio_language=eng';
+    const PREBUF_TIMEOUT_MS = 60000;
+    const STAT_POLL_MS = 1500;
+
+    const searchForm = document.getElementById('searchForm');
+    const acePanel = document.getElementById('acePanel');
+    const aceIframe = document.getElementById('aceIframe');
+    const schedulePanel = document.getElementById('schedulePanel');
+    const overlay = document.getElementById('playerOverlay');
+    const statusText = document.getElementById('statusText');
+    const subStatusText = document.getElementById('subStatusText');
+    const engineBadge = document.getElementById('engineBadge');
+    const actionBtns = document.getElementById('actionBtns');
+    const openAppBtn = document.getElementById('openAppBtn');
+    const retryBtn = document.getElementById('retryBtn');
+    const playerWrapper = document.getElementById('player-wrapper');
+
+    searchForm.addEventListener('submit', e => {
+        e.preventDefault();
+        const query = document.getElementById('query').value.trim();
+        if (!query) return;
+        aceIframe.src = 'https://search-ace.stream/?query=' + encodeURIComponent(query);
+        acePanel.classList.add('active');
+    });
+
+    function openSchedulePanel() { schedulePanel.classList.add('active'); }
+    function closePanel(id) { document.getElementById(id).classList.remove('active'); }
+
+    function openEngineApp() {
+        window.location.href = 'intent://#Intent;package=org.acestream.engine;end';
+        setTimeout(function () {
+            window.location.href = 'acestream://';
+        }, 400);
+    }
+    document.getElementById('openEngineBtn').addEventListener('click', openEngineApp);
+
+    let channelsData = [];
+    let playerInstance = null;
+    let currentContentId = '';
+    let currentChannelName = '';
+    let session = null;
+    let statTimer = null;
+    let prebufStartedAt = 0;
+    let playGeneration = 0;
+    let engineOnline = false;
+
+    function normalizeContentId(raw) {
+        if (!raw) return '';
+        var id = String(raw).trim();
+        var ace = id.match(/acestream:\/\/([a-fA-F0-9]{40})/);
+        if (ace) return ace[1].toLowerCase();
+        if (/^[a-fA-F0-9]{40}$/.test(id)) return id.toLowerCase();
+        return id;
+    }
+
+    function decodeChannelId(channel) {
+        var contentId = '';
+        try {
+            if (channel.streamHash) contentId = atob(channel.streamHash);
+            else if (channel.streamUrl) contentId = channel.streamUrl;
+        } catch (err) {
+            console.error('解密失敗', err);
+        }
+        return normalizeContentId(contentId);
+    }
+
+    function randomPid() {
+        var bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+    }
+
+    function setOverlay(opts) {
+        if (opts.hide) {
+            overlay.classList.add('hidden');
+            return;
+        }
+        overlay.classList.remove('hidden');
+        if (opts.title != null) statusText.innerText = opts.title;
+        if (opts.sub != null) subStatusText.innerText = opts.sub;
+        actionBtns.style.display = opts.showActions ? 'flex' : 'none';
+    }
+
+    function setEngineBadge(online, extra) {
+        engineOnline = !!online;
+        engineBadge.textContent = online
+            ? (extra ? 'Engine 已連接 · ' + extra : 'Engine 已連接（127.0.0.1:' + ENGINE_PORT + '）')
+            : (extra || 'Engine 未確認（仍可嘗試播放）');
+    }
+
+    async function fetchJson(url, timeoutMs) {
+        timeoutMs = timeoutMs || 8000;
+        var ctrl = new AbortController();
+        var t = setTimeout(function () { ctrl.abort(); }, timeoutMs);
+        try {
+            var res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.json();
+        } finally {
+            clearTimeout(t);
+        }
+    }
+
+    function engineAliveJsonp() {
+        return new Promise(function (resolve) {
+            var cb = 'aceVer_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
+            var s = document.createElement('script');
+            var done = false;
+            var timer = setTimeout(function () { finish(false); }, 2500);
+            function finish(ok, ver) {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                try { delete window[cb]; } catch (_) {}
+                if (s.parentNode) s.parentNode.removeChild(s);
+                if (ok) setEngineBadge(true, ver ? ('v' + ver) : '');
+                else setEngineBadge(false);
+                resolve(ok);
+            }
+            window[cb] = function (data) {
+                var ver = data && (data.result || data.response || data.version || data.code);
+                finish(true, ver);
+            };
+            s.onerror = function () { finish(false); };
+            s.src = ENGINE + '/webui/api/service?method=get_version&format=jsonp&callback=' + cb;
+            document.head.appendChild(s);
+        });
+    }
+
+    async function engineAliveFetch() {
+        try {
+            var data = await fetchJson(ENGINE + '/webui/api/service?method=get_version&format=json', 2500);
+            var ver = data && (data.result || data.response || data.version || data.code);
+            setEngineBadge(true, ver ? ('v' + ver) : '');
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    async function engineAlive() {
+        if (await engineAliveJsonp()) return true;
+        return engineAliveFetch();
+    }
+
+    function stopStatPoll() {
+        if (statTimer) {
+            clearInterval(statTimer);
+            statTimer = null;
+        }
+    }
+
+    async function stopSession() {
+        stopStatPoll();
+        var cmd = session && session.command_url;
+        session = null;
+        if (!cmd) return;
+        try {
+            await fetch(cmd + (cmd.indexOf('?') >= 0 ? '&' : '?') + 'method=stop', { cache: 'no-store' });
+        } catch (_) {}
+    }
+
+    function destroyPlayer() {
+        if (playerInstance) {
+            try { playerInstance.destroy(); } catch (_) {}
+            playerInstance = null;
+        }
+        playerWrapper.innerHTML = '';
+    }
+
+    function formatSpeed(kb) {
+        var n = Number(kb) || 0;
+        if (n >= 1000) return (n / 1000).toFixed(1) + ' MB/s';
+        return Math.round(n) + ' KB/s';
+    }
+
+    function startStatPoll(gen) {
+        stopStatPoll();
+        if (!session || !session.stat_url) return;
+        statTimer = setInterval(async function () {
+            if (gen !== playGeneration || !session || !session.stat_url) return;
+            try {
+                var data = await fetchJson(session.stat_url, 4000);
+                var st = data.response || data;
+                var status = st.status || '';
+                var peers = st.peers != null ? st.peers : (st.peers_count || 0);
+                var down = st.speed_down || 0;
+                var up = st.speed_up || 0;
+                if (status === 'prebuf') {
+                    var waited = Math.round((Date.now() - prebufStartedAt) / 1000);
+                    setOverlay({
+                        title: '正在緩衝：' + currentChannelName,
+                        sub: '預緩衝中 · peers ' + peers + ' · 下載 ' + formatSpeed(down) + ' · 已等 ' + waited + 's'
+                    });
+                    if (Date.now() - prebufStartedAt > PREBUF_TIMEOUT_MS && peers === 0) {
+                        failPlayback('長時間冇 peer，可能冇人分享或者 Content ID 已失效', gen);
+                    }
+                } else if (status === 'dl') {
+                    subStatusText.innerText = '播放中 · peers ' + peers + ' · ↓ ' + formatSpeed(down) + ' · ↑ ' + formatSpeed(up);
+                }
+            } catch (_) {}
+        }, STAT_POLL_MS);
+    }
+
+    function attachPlayer(playbackUrl, gen) {
+        destroyPlayer();
+        playerWrapper.innerHTML = '<div id="clappr-player" style="width:100%;height:100%;"></div>';
+        playerInstance = new Clappr.Player({
+            source: playbackUrl,
+            parentId: '#clappr-player',
+            width: '100%',
+            height: '100%',
+            autoPlay: true,
+            mute: false,
+            mimeType: 'application/x-mpegURL',
+            events: {
+                onReady: function () {
+                    if (gen !== playGeneration) return;
+                    try { this.play(); } catch (_) {}
+                },
+                onPlay: function () {
+                    if (gen !== playGeneration) return;
+                    setEngineBadge(true);
+                    setOverlay({ hide: true });
+                    var videoEl = playerWrapper.querySelector('video');
+                    if (videoEl) videoEl.muted = false;
+                },
+                onError: function (e) {
+                    console.error('Clappr Error:', e);
+                    if (gen !== playGeneration) return;
+                    if (Date.now() - prebufStartedAt < 12000) return;
+                    failPlayback('播放器讀串流失敗。請確認已開啟 Ace Stream Engine。', gen);
+                }
+            }
+        });
+    }
+
+    async function failPlayback(message, gen) {
+        if (gen !== playGeneration) return;
+        stopStatPoll();
+        destroyPlayer();
+        setOverlay({ title: '播放失敗', sub: message, showActions: true });
+    }
+
+    async function startAceStreamByContentId(contentId, channelName) {
+        contentId = normalizeContentId(contentId);
+        currentContentId = contentId;
+        currentChannelName = channelName;
+        var gen = ++playGeneration;
+
+        setOverlay({
+            title: '正在連接：' + channelName,
+            sub: '正在停止上一條 session，並探測本機 Engine…',
+            showActions: false
+        });
+
+        await stopSession();
+        if (gen !== playGeneration) return;
+
+        var alive = await engineAlive();
+        if (gen !== playGeneration) return;
+        if (!alive) {
+            setOverlay({
+                title: '正在連接：' + channelName,
+                sub: '探測 Engine 未成功（WebView 可能擋 fetch）。仍然嘗試直連 HLS…',
+                showActions: false
+            });
+        }
+
+        var pid = randomPid();
+        var api = ENGINE + '/ace/manifest.m3u8?id=' + encodeURIComponent(contentId) +
+            '&format=json&pid=' + pid + TRANSCODE;
+
+        var playbackUrl = '';
+        try {
+            var data = await fetchJson(api, 20000);
+            if (data.error) throw new Error(typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
+            var resp = data.response || data;
+            if (!resp.playback_url) throw new Error('Engine 冇回傳 playback_url');
+            session = {
+                playback_url: resp.playback_url,
+                stat_url: resp.stat_url,
+                command_url: resp.command_url
+            };
+            playbackUrl = resp.playback_url;
+            setEngineBadge(true);
+        } catch (err) {
+            console.warn('format=json 失敗，改用直連 HLS：', err);
+            if (gen !== playGeneration) return;
+            playbackUrl = ENGINE + '/ace/manifest.m3u8?id=' + encodeURIComponent(contentId) +
+                '&pid=' + pid + TRANSCODE;
+            session = { playback_url: playbackUrl, stat_url: null, command_url: null };
+            setOverlay({
+                title: '正在連接：' + channelName,
+                sub: '已改直連 HLS（JSON session 不可用時嘅後備）…'
+            });
+        }
+
+        if (gen !== playGeneration) return;
+        prebufStartedAt = Date.now();
+        setOverlay({
+            title: '正在緩衝：' + channelName,
+            sub: 'P2P 預緩衝中，首次可能要十至數十秒…'
+        });
+        attachPlayer(playbackUrl, gen);
+        startStatPoll(gen);
+    }
+
+    function playChannel(channel) {
+        var contentId = decodeChannelId(channel);
+        if (!contentId) {
+            alert('無效的頻道 Content ID');
+            return;
+        }
+        startAceStreamByContentId(contentId, channel.name);
+    }
+
+    openAppBtn.addEventListener('click', function () {
+        if (!currentContentId) return;
+        window.location.href = 'acestream://' + currentContentId;
+    });
+    retryBtn.addEventListener('click', function () {
+        if (!currentContentId) return;
+        startAceStreamByContentId(currentContentId, currentChannelName || currentContentId);
+    });
+
+    function exportToM3U() {
+        if (!channelsData.length) {
+            alert('尚無頻道資料');
+            return;
+        }
+        var m3uContent = '#EXTM3U\n';
+        channelsData.forEach(function (channel) {
+            var contentId = decodeChannelId(channel);
+            if (contentId) {
+                m3uContent += '#EXTINF:-1,' + channel.name + '\n';
+                m3uContent += ENGINE + '/ace/getstream?id=' + contentId + TRANSCODE + '\n';
+            }
+        });
+        var blob = new Blob([m3uContent], { type: 'audio/x-mpegurl' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'aceball_channels.m3u';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    function renderChannels(channels) {
+        var listContainer = document.getElementById('channelList');
+        listContainer.innerHTML = '';
+        channels.forEach(function (channel) {
+            var item = document.createElement('div');
+            item.className = 'channel-item';
+            item.textContent = channel.name;
+            item.onclick = function () {
+                document.querySelectorAll('.channel-item').forEach(function (el) { el.classList.remove('active'); });
+                item.classList.add('active');
+                playChannel(channel);
+            };
+            listContainer.appendChild(item);
+        });
+    }
+
+    async function fetchChannels() {
+        var list = document.getElementById('channelList');
+        list.innerHTML = '<div class="loading-text">正在由 Netlify 載入頻道…</div>';
+        try {
+            var url = CHANNELS_URL + (CHANNELS_URL.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
+            var data = await fetchJson(url, 12000);
+            channelsData = Array.isArray(data) ? data : [];
+            if (!channelsData.length) {
+                list.innerHTML = '<div class="loading-text" style="color:#f87171;">頻道表空白</div>';
+                return;
+            }
+            renderChannels(channelsData);
+        } catch (error) {
+            console.error(error);
+            list.innerHTML = '<div class="loading-text" style="color:#f87171;">載入頻道失敗。請確認 Netlify 已放 channels.json，並已部署 netlify.toml（CORS）。</div>';
+        }
+    }
+
+    document.getElementById('reloadChannelsBtn').addEventListener('click', fetchChannels);
+
+    window.addEventListener('beforeunload', function () {
+        if (session && session.command_url) {
+            var url = session.command_url + (session.command_url.indexOf('?') >= 0 ? '&' : '?') + 'method=stop';
+            try { navigator.sendBeacon(url); } catch (_) {}
+        }
+    });
+
+    fetchChannels();
+    engineAlive();
+    setInterval(engineAlive, 10000);
+</script>
+</body>
+</html>
