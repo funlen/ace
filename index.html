@@ -66,7 +66,7 @@
 </div>
 
 <script>
-    const CHANNELS_URL = 'https://cootest.netlify.app/channels.json';
+    const CHANNELS_URL = 'https://funlen.github.io/ace/channels.json';
     const ENGINE_HOST = 'http://127.0.0.1';
     const ENGINE_PORT = 6878;
     const ENGINE = ENGINE_HOST + ':' + ENGINE_PORT;
@@ -438,7 +438,7 @@
 
     async function fetchChannels() {
         var list = document.getElementById('channelList');
-        list.innerHTML = '<div class="loading-text">正在由 Netlify 載入頻道…</div>';
+        list.innerHTML = '<div class="loading-text">正在載入頻道…</div>';
         try {
             var url = CHANNELS_URL + (CHANNELS_URL.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
             var data = await fetchJson(url, 12000);
@@ -450,7 +450,7 @@
             renderChannels(channelsData);
         } catch (error) {
             console.error(error);
-            list.innerHTML = '<div class="loading-text" style="color:#f87171;">載入頻道失敗。請確認 Netlify 已放 channels.json，並已部署 netlify.toml（CORS）。</div>';
+            list.innerHTML = '<div class="loading-text" style="color:#f87171;">載入頻道失敗。請確認伺服器已放置 channels.json，並已部署 netlify.toml（CORS）。</div>';
         }
     }
 
